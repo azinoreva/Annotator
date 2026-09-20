@@ -252,7 +252,6 @@ async def health():
 @app.get("/stats")
 async def stats():
     from models.annotation_model import (
-        Analysis,
         ProcessedAnnotation,
         ReceivedAnnotation,
         SentAnnotation,
@@ -261,8 +260,9 @@ async def stats():
     received = await ReceivedAnnotation.all().count()
     processed = await ProcessedAnnotation.all().count()
     sent = await SentAnnotation.all().count()
-    category_names = await Analysis.all().values_list("category_name", flat=True)
-    categories = len(set(category_names))
+    # "categories" = subcategory assignments (the correlations on each
+    # processed annotation), tracked in memory so it grows with every item.
+    categories = worker.subcategory_count()
     rate = worker.processing_rate()
 
     return {

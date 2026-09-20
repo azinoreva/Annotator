@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from typing import Optional
 
@@ -39,14 +40,57 @@ WAIT_FOR_CONFIG = 15.0
 _ENGINE = FeedAnnotationEngine()
 _SAFETY = ContentSafetyEngine()
 
-# Rolling timestamps of finished processing runs (for the /stats rate).
-_PROCESS_TIMES: list[float] = []
+# Throughput accounting: everything lives in memory and is anchored to the
+# moment the worker started, so the average rate is meaningful even when the
+# pipeline is slow (a 60s rolling window would read 0 in that case).
+_STARTED_AT = time.monotonic()
+_PROCESSED_COUNT = 0
+_SUBCATEGORY_COUNT = 0
+_COUNT_LOCK = threading.Lock()
 
 
-def processing_rate(window_seconds: float = 60.0) -> int:
-    """How many items were processed in the last `window_seconds`."""
-    cutoff = time.time() - window_seconds
-    return sum(1 for t in _PROCESS_TIMES if t >= cutoff)
+def _record_processed() -> None:
+    """Count one finished processing run (safe across worker threads)."""
+    global _PROCESSED_COUNT
+    with _COUNT_LOCK:
+        _PROCESSED_COUNT += 1
+
+
+def _record_subcategories(count: int) -> None:
+    """Add `count` subcategory assignments (the per-annotation correlations)."""
+    global _SUBCATEGORY_COUNT
+    with _COUNT_LOCK:
+        _SUBCATEGORY_COUNT += count
+
+
+def reset_rate_window() -> None:
+    """Re-anchor the rate calculation. Used when the app (re)starts."""
+    global _STARTED_AT, _PROCESSED_COUNT, _SUBCATEGORY_COUNT
+    with _COUNT_LOCK:
+        _STARTED_AT = time.monotonic()
+        _PROCESSED_COUNT = 0
+        _SUBCATEGORY_COUNT = 0
+
+
+def processing_rate() -> float:
+    """
+    Average throughput since startup: total processed / elapsed seconds.
+
+    Guarded against both an idle pipeline (count == 0) and a zero elapsed
+    span at startup so it never divides by zero or returns bogus spikes.
+    """
+    with _COUNT_LOCK:
+        count = _PROCESSED_COUNT
+    if count <= 0:
+        return 0.0
+    elapsed = time.monotonic() - _STARTED_AT
+    return count / elapsed if elapsed > 0 else 0.0
+
+
+def subcategory_count() -> int:
+    """Total subcategory assignments since startup (grows with each item)."""
+    with _COUNT_LOCK:
+        return _SUBCATEGORY_COUNT
 
 
 # ---------------------------------------------------------------------------
@@ -214,9 +258,8 @@ async def _process_one(row) -> None:
 
     # 6) The update is fully processed — remove it from the intake table.
     await crud.delete_received_annotation(row.update_id)
-    _PROCESS_TIMES.append(time.time())
-    if len(_PROCESS_TIMES) > 10_000:
-        del _PROCESS_TIMES[:-10_000]
+    _record_subcategories(len(annotations["correlations"]))
+    _record_processed()
 
 
 # ---------------------------------------------------------------------------
@@ -233,11 +276,23 @@ def _decode_update(data: str) -> dict:
     return {"text": data}
 
 
-def _morality_check(text: str) -> dict:
+def _morality_check(text: str) -> Optional[dict]:
     messages = [
         {"role": "system", "content": _SAFETY.system_message()},
         {"role": "user", "content": _SAFETY.user_message(text)},
     ]
     response = chat(messages, model=get_active_model()).content
-    annotation = _SAFETY.parse(response)
+
+    try:
+        annotation = _SAFETY.parse(response)
+    except ValueError as exc:
+        # The model sometimes invents flags outside the taxonomy (e.g. an
+        # unknown content flag). That is a malformed model answer, not an
+        # infrastructure failure — degrade gracefully by leaving the
+        # morality pass unverified instead of failing the whole item.
+        log.warning(
+            "Morality check skipped (malformed model response): %s", exc
+        )
+        return None
+
     return annotation.model_dump()
