@@ -37,7 +37,7 @@ log = logging.getLogger("annotator")
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
-DEFAULT_MODEL  = "qwen2.5-coder:7b"
+DEFAULT_MODEL  = "llama3.2:3b"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 SERVICE_PORT   = 25340
 
