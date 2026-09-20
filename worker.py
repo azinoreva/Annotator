@@ -33,6 +33,8 @@ log = logging.getLogger("annotator.worker")
 PROCESS_DELAY = 2.0
 # How long to wait before reconnecting to the SSE stream after an error.
 RECONNECT_DELAY = 5.0
+# How long to wait between attempts when credentials are not configured yet.
+WAIT_FOR_CONFIG = 15.0
 
 _ENGINE = FeedAnnotationEngine()
 _SAFETY = ContentSafetyEngine()
@@ -69,7 +71,22 @@ async def _store_received(update: dict) -> None:
 async def stream_loop(queue: asyncio.Queue) -> None:
     """Subscribe to the annotator SSE stream; bank every update in the DB."""
     filters = RequestUpdates()
+    _warned = False
     while True:
+        # If credentials haven't been configured yet, wait quietly instead
+        # of spamming the logs with errors — the operator may still be
+        # filling in the settings page.
+        if not login_mod.is_configured():
+            if not _warned:
+                log.info(
+                    "No annotator credentials configured yet — waiting for "
+                    "them to be added (set them via the config page)."
+                )
+                _warned = True
+            await asyncio.sleep(WAIT_FOR_CONFIG)
+            continue
+
+        _warned = False
         try:
             token = await login_mod.ensure_token()
             async for update in server.subscribe_updates(filters, token):
@@ -78,7 +95,10 @@ async def stream_loop(queue: asyncio.Queue) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("SSE stream error — reconnecting in %.0fs.", RECONNECT_DELAY)
+            log.info(
+                "SSE stream unavailable right now — retrying in %.0fs.",
+                RECONNECT_DELAY,
+            )
             await asyncio.sleep(RECONNECT_DELAY)
 
 
@@ -113,6 +133,16 @@ async def process_loop(queue: asyncio.Queue) -> None:
 
 
 async def _process_pending() -> None:
+    # Processing requires the server credentials; hold off quietly until
+    # they are configured so we don't error-spam while the operator is
+    # still setting things up.
+    if not login_mod.is_configured():
+        log.info(
+            "Updates are banked but credentials are not configured yet — "
+            "processing will resume once they are added."
+        )
+        return
+
     received = await crud.list_received_annotations()
     if not received:
         return

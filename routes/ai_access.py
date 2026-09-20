@@ -1,27 +1,42 @@
 """
-ollama_client.py
+routes/ai_access.py
 
 Production-grade wrapper around the `ollama` Python package.
 
 Responsibilities
 ----------------
-1. Verify that the Ollama runtime is installed and reachable via subprocess.
-2. Ensure the requested model is available locally (pull if missing).
-3. Provide a single, safe entry point (`chat`) for sending messages to the
-   model through `ollama.chat`.
+1. Provide a single, bounded availability probe (`runtime_available`) so the
+   host app can decide "is Ollama reachable?" without hanging.
+2. Ensure a requested model is pulled locally via the HTTP API (no shelling
+   out to the CLI on every call), using a short-lived TTL cache for speed.
+3. Expose `chat` / `chat_stream` with an explicit timeout, retries that only
+   cover *transient* failures, and exponential backoff + jitter — never a
+   busy-spin.
 
-Only `logging` is used for diagnostics — no bare `print` calls.
+Design notes
+------------
+- One shared ``ollama.Client`` per host + timeout tier, built lazily behind a
+  lock (the worker calls ``chat`` from ``asyncio.to_thread``).
+- No name shadowing of the `ollama` API (the previous version rebound the
+  imported `chat` symbol with its wrapper, silently recursing forever).
+- Every outbound call is bounded by an ``httpx`` timeout. Ollama's default is
+  ``timeout=None`` (block forever), which made the old availability loop hang.
+- Only `logging` is used for diagnostics — no bare `print` calls.
 """
 
 from __future__ import annotations
 
 import logging
-import shutil
-import subprocess
+import os
+import random
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
-from ollama import chat
+import httpx
+import ollama
+from ollama import ResponseError
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -29,18 +44,43 @@ from ollama import chat
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     # Library-friendly default; the host application can override this.
-    _handler = logging.NullHandler()
-    logger.addHandler(_handler)
+    logger.addHandler(logging.NullHandler())
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+HOST_ENV = "OLLAMA_HOST"
+DEFAULT_HOST = "http://127.0.0.1:11434"
+
 DEFAULT_MODEL: str = "llama3.2"
-DEFAULT_TIMEOUT: int = 300          # seconds for subprocess calls
-DEFAULT_CHAT_TIMEOUT: float = 120.0  # seconds for chat requests
+
+# httpx timeouts (seconds). These are the real bound on every HTTP call.
+CONNECT_TIMEOUT: float = 5.0      # dialing the socket must not take forever
+REQUEST_TIMEOUT: float = 120.0    # ordinary chat / list requests
+PULL_TIMEOUT: float = 3600.0      # model pulls can legitimately run long
+PROBE_TIMEOUT: float = 5.0        # availability probe is deliberately short
+
+# Availability check caching: positive answers are trusted longer, negative
+# ones expire fast so a recovering daemon is noticed quickly.
+AVAILABILITY_TTL: float = 60.0
+NEGATIVE_TTL: float = 15.0
+
+RETRY_BASE_DELAY: float = 0.5    # exponential backoff base (seconds)
+RETRY_MAX_DELAY: float = 8.0     # backoff cap
+RETRY_JITTER: float = 0.25       # fraction of delay added/removed randomly
+
+# HTTP statuses that are worth retrying. 4xx (except 408/429) are permanent
+# client errors — retrying a 401 or a bad request forever is a busy-loop.
+_TRANSIENT_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+# Statuses that mean "this value of `model` will never work" — fail fast.
+_BAD_REQUEST_STATUSES = frozenset({400, 401, 403, 404, 409, 422})
 
 
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 class OllamaClientError(RuntimeError):
     """Base exception raised for all client-level failures."""
 
@@ -70,93 +110,148 @@ class ChatResult:
 
 
 # ---------------------------------------------------------------------------
-# Subprocess helpers
+# Shared clients (thread-safe, lazily created, cached per host + tier)
 # ---------------------------------------------------------------------------
-def _run_ollama_cli(
-    args: Sequence[str],
-    *,
-    timeout: int = DEFAULT_TIMEOUT,
-) -> subprocess.CompletedProcess[str]:
+_client_lock: threading.Lock = threading.Lock()
+_request_client: dict[str, ollama.Client] = {}      # REQUEST_TIMEOUT
+_pull_client: dict[str, ollama.Client] = {}         # PULL_TIMEOUT
+_probe_client: dict[str, ollama.Client] = {}        # PROBE_TIMEOUT
+
+
+def _normalize_host(host: str | None) -> str:
+    return host or os.getenv(HOST_ENV) or DEFAULT_HOST
+
+
+def _get_client(host: str | None) -> ollama.Client:
+    base = _normalize_host(host)
+    with _client_lock:
+        client = _request_client.get(base)
+        if client is None:
+            client = ollama.Client(
+                host=base,
+                timeout=httpx.Timeout(
+                    REQUEST_TIMEOUT,
+                    connect=CONNECT_TIMEOUT,
+                ),
+            )
+            _request_client[base] = client
+        return client
+
+
+def _get_pull_client(host: str | None) -> ollama.Client:
+    base = _normalize_host(host)
+    with _client_lock:
+        client = _pull_client.get(base)
+        if client is None:
+            client = ollama.Client(
+                host=base,
+                timeout=httpx.Timeout(PULL_TIMEOUT, connect=CONNECT_TIMEOUT),
+            )
+            _pull_client[base] = client
+        return client
+
+
+def _get_probe_client(host: str | None) -> ollama.Client:
+    base = _normalize_host(host)
+    with _client_lock:
+        client = _probe_client.get(base)
+        if client is None:
+            # Uniform short timeout: a stuck daemon must fail fast here.
+            client = ollama.Client(
+                host=base,
+                timeout=httpx.Timeout(PROBE_TIMEOUT),
+            )
+            _probe_client[base] = client
+        return client
+
+
+# ---------------------------------------------------------------------------
+# Availability probe
+# ---------------------------------------------------------------------------
+def runtime_available(host: str | None = None) -> bool:
     """
-    Execute the `ollama` CLI with the given arguments.
+    Return True when the Ollama runtime responds on ``host``.
 
-    Raises
-    ------
-    OllamaNotInstalledError
-        If the `ollama` binary is not on PATH.
-    OllamaRuntimeError
-        On non-zero exit, timeout, or unexpected OS-level failure.
+    Bounded by ``PROBE_TIMEOUT`` and never raises — callers can safely poll
+    this from a loop without hanging the event loop or a thread.
     """
-    binary = shutil.which("ollama")
-    if binary is None:
-        msg = "Ollama CLI not found on PATH. Install from https://ollama.com."
-        logger.error(msg)
-        raise OllamaNotInstalledError(msg)
-
-    cmd = [binary, *args]
-    logger.debug("Executing subprocess: %s", cmd)
-
     try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        msg = f"`ollama {' '.join(args)}` timed out after {timeout}s."
-        logger.error(msg)
-        raise OllamaRuntimeError(msg) from exc
-    except OSError as exc:
-        msg = f"OS error while invoking ollama: {exc}"
-        logger.exception(msg)
-        raise OllamaRuntimeError(msg) from exc
-
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        msg = (
-            f"`ollama {' '.join(args)}` failed with exit code "
-            f"{completed.returncode}: {stderr or '<no stderr>'}"
-        )
-        logger.error(msg)
-        raise OllamaRuntimeError(msg)
-
-    return completed
-
-
-# ---------------------------------------------------------------------------
-# Model management
-# ---------------------------------------------------------------------------
-def _list_local_models() -> set[str]:
-    """Return the set of model names currently available locally."""
-    completed = _run_ollama_cli(["list"])
-    models: set[str] = set()
-    for line in completed.stdout.splitlines()[1:]:  # skip header
-        line = line.strip()
-        if not line:
-            continue
-        # First whitespace-delimited token is the model name.
-        models.add(line.split()[0])
-    logger.debug("Locally available models: %s", models)
-    return models
-
-
-def _model_is_available(model: str) -> bool:
-    """Return True when `model` (or a matching tag) is present locally."""
-    local = _list_local_models()
-    if model in local:
+        _get_probe_client(host).list()
         return True
-    # Allow un-tagged references, e.g. "llama3.2" -> "llama3.2:latest".
-    base = model.split(":", 1)[0]
-    return any(name == base or name.startswith(f"{base}:") for name in local)
+    except Exception:  # noqa: BLE001 — probing is intentionally total
+        logger.debug("Ollama runtime not available on %s.", _normalize_host(host))
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Model management (HTTP API + TTL cache, no subprocess per call)
+# ---------------------------------------------------------------------------
+_availability_cache: dict[str, tuple[bool, float]] = {}
+
+
+def _model_is_available(model: str, host: str | None) -> bool:
+    """Return True when `model` (or its un-tagged base) is present locally.
+
+    Cached for ``AVAILABILITY_TTL`` (or ``NEGATIVE_TTL`` on failure) so the
+    steady-state path does not hit the HTTP API on every single message.
+    """
+    base_host = _normalize_host(host)
+    key = f"{base_host}|{model}"
+    with _client_lock:
+        cached = _availability_cache.get(key)
+        if cached is not None:
+            available, checked_at = cached
+            ttl = AVAILABILITY_TTL if available else NEGATIVE_TTL
+            if time.monotonic() - checked_at < ttl:
+                return available
+
+    available = False
+    try:
+        listing = _get_client(host).list()
+        local: set[str] = set()
+        for m in getattr(listing, "models", None) or []:
+            name = getattr(m, "model", None)
+            if isinstance(name, str):
+                local.add(name)
+            elif isinstance(m, Mapping):
+                name = m.get("model") or m.get("name")
+                if isinstance(name, str):
+                    local.add(name)
+        base = model.split(":", 1)[0]
+        available = model in local or any(
+            name == base or name.startswith(f"{base}:") for name in local
+        )
+    except Exception as exc:  # noqa: BLE001 — negative result, don't raise
+        logger.debug("Model availability check failed: %s", exc)
+
+    with _client_lock:
+        _availability_cache[key] = (available, time.monotonic())
+    return available
+
+
+def _pull_model(model: str, host: str | None) -> None:
+    """Pull `model` through the HTTP API (never the CLI)."""
+    for chunk in _get_pull_client(host).pull(model, stream=True):
+        err = getattr(chunk, "error", None)
+        if err is None and isinstance(chunk, Mapping):
+            err = chunk.get("error")
+        if err:
+            raise OllamaRuntimeError(
+                f"Failed to pull model '{model}': {err}"
+            )
+        status = getattr(chunk, "status", None)
+        if status is None and isinstance(chunk, Mapping):
+            status = chunk.get("status")
+        if status:
+            logger.info("  pull: %s", status)
 
 
 def ensure_model(
     model: str = DEFAULT_MODEL,
     *,
     auto_pull: bool = True,
-    pull_timeout: int = DEFAULT_TIMEOUT,
+    pull_timeout: float | None = None,
+    host: str | None = None,
 ) -> str:
     """
     Guarantee that `model` is present locally; pull it if missing.
@@ -168,35 +263,72 @@ def ensure_model(
 
     Raises
     ------
-    OllamaClientError
-        If the model is unavailable and cannot be pulled.
+    OllamaRuntimeError
+        If the runtime is unreachable, or the model cannot be pulled.
     """
+    del pull_timeout  # kept for back-compat; the client governs the timeout
     if not model or not isinstance(model, str):
         raise ValueError("`model` must be a non-empty string.")
 
-    try:
-        if _model_is_available(model):
-            logger.info("Model '%s' is available locally.", model)
-            return model
-    except OllamaClientError:
-        # Runtime unreachable — let the caller decide how to react.
-        raise
+    if _model_is_available(model, host):
+        logger.info("Model '%s' is available locally.", model)
+        return model
 
     if not auto_pull:
-        msg = f"Model '{model}' is not available locally and auto_pull is disabled."
-        logger.error(msg)
-        raise OllamaRuntimeError(msg)
+        raise OllamaRuntimeError(
+            f"Model '{model}' is not available locally and auto_pull is disabled."
+        )
 
     logger.info("Model '%s' not found locally — pulling.", model)
-    try:
-        _run_ollama_cli(["pull", model], timeout=pull_timeout)
-    except OllamaRuntimeError as exc:
-        msg = f"Failed to pull model '{model}': {exc}"
-        logger.error(msg)
-        raise OllamaRuntimeError(msg) from exc
-
+    _pull_model(model, host)
     logger.info("Successfully pulled model '%s'.", model)
+
+    # Refresh the cache so the very next call does not re-list.
+    with _client_lock:
+        _availability_cache[f"{_normalize_host(host)}|{model}"] = (
+            True,
+            time.monotonic(),
+        )
     return model
+
+
+# ---------------------------------------------------------------------------
+# Retry policy
+# ---------------------------------------------------------------------------
+def _is_transient(exc: Exception) -> bool:
+    """Return True when a retry is reasonable for this exception."""
+    if isinstance(exc, ConnectionError):
+        return True  # ollama Client wraps httpx.ConnectError into this
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.NetworkError):
+        return True
+    if isinstance(exc, ResponseError):
+        return exc.status_code in _TRANSIENT_STATUSES
+    return False
+
+
+def _is_permanent(exc: Exception) -> bool:
+    """Return True when retrying can never help (fail fast)."""
+    if isinstance(exc, ResponseError):
+        return exc.status_code in _BAD_REQUEST_STATUSES
+    return False
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff with full jitter; bounded."""
+    base = min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+    jitter = 1.0 + random.uniform(-RETRY_JITTER, RETRY_JITTER)
+    return max(0.05, base * jitter)
+
+
+def _raise_chat_error(model: str, attempts: int, last_error: Exception) -> None:
+    msg = (
+        f"Chat failed for model '{model}' after {attempts} attempt(s): "
+        f"{last_error}"
+    )
+    logger.error(msg)
+    raise OllamaChatError(msg) from last_error
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +341,7 @@ def chat(
     auto_pull: bool = True,
     retries: int = 2,
     options: Mapping[str, Any] | None = None,
+    host: str | None = None,
     **kwargs: Any,
 ) -> ChatResult:
     """
@@ -225,9 +358,13 @@ def chat(
     auto_pull
         Whether to pull the model if it is not already available locally.
     retries
-        Number of additional attempts on transient runtime failures.
+        Number of additional attempts on *transient* failures. Permanent
+        (4xx) errors fail immediately without burning the retry budget.
     options
         Optional Ollama model options (temperature, num_ctx, …).
+    host
+        Ollama base URL. Defaults to ``$OLLAMA_HOST`` then
+        :data:`DEFAULT_HOST`.
     **kwargs
         Forwarded verbatim to :func:`ollama.chat`.
 
@@ -239,7 +376,7 @@ def chat(
     Raises
     ------
     OllamaChatError
-        If all attempts to obtain a completion fail.
+        If no non-transient success is obtained within the retry budget.
     """
     if isinstance(messages, str):
         normalized: list[Mapping[str, Any]] = [
@@ -250,18 +387,18 @@ def chat(
 
     if not normalized:
         raise ValueError("`messages` must contain at least one message.")
-
     if retries < 0:
         raise ValueError("`retries` must be >= 0.")
 
     # ---- Ensure model availability (fail fast before entering retry loop) --
     try:
-        resolved_model = ensure_model(model, auto_pull=auto_pull)
+        resolved_model = ensure_model(model, auto_pull=auto_pull, host=host)
     except OllamaClientError as exc:
         raise OllamaChatError(str(exc)) from exc
 
-    last_error: Exception | None = None
+    client = _get_client(host)
     attempts = retries + 1
+    last_error: Exception | None = None
 
     for attempt in range(1, attempts + 1):
         try:
@@ -271,7 +408,7 @@ def chat(
                 attempts,
                 resolved_model,
             )
-            response = ollama.chat(
+            response = client.chat(
                 model=resolved_model,
                 messages=normalized,
                 options=dict(options) if options else None,
@@ -286,71 +423,42 @@ def chat(
             return ChatResult(
                 content=content,
                 model=resolved_model,
-                raw=response if isinstance(response, Mapping) else {},
+                raw=_as_mapping(response),
             )
-        except (ollama.ResponseError, ollama.RequestError) as exc:
+        except Exception as exc:  # noqa: BLE001 — normalize & classify
             last_error = exc
+            if _is_permanent(exc):
+                logger.error(
+                    "Permanent error on chat attempt %d/%d: %s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                break
+            if not _is_transient(exc):
+                logger.error(
+                    "Non-retryable error on chat attempt %d/%d: %s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                break
             logger.warning(
-                "Ollama API error on attempt %d/%d: %s",
+                "Transient error on chat attempt %d/%d: %s",
                 attempt,
                 attempts,
                 exc,
             )
-        except Exception as exc:  # noqa: BLE001 — defensive boundary
-            last_error = exc
-            logger.exception(
-                "Unexpected error on chat attempt %d/%d: %s",
-                attempt,
-                attempts,
-                exc,
-            )
+            if attempt < attempts:
+                time.sleep(_backoff_delay(attempt))
 
-    msg = (
-        f"Chat failed for model '{resolved_model}' after {attempts} "
-        f"attempt(s): {last_error}"
-    )
-    logger.error(msg)
-    raise OllamaChatError(msg) from last_error
+    _raise_chat_error(resolved_model, attempts, last_error or RuntimeError("unknown"))
+    # Unreachable — _raise_chat_error always raises.  (Kept for type checkers.)
+    raise AssertionError("unreachable")
 
 
 # ---------------------------------------------------------------------------
-# Internal utilities
-# ---------------------------------------------------------------------------
-def _extract_content(response: Any) -> str:
-    """
-    Pull the assistant's textual content out of an Ollama chat response.
-
-    Supports both mapping-style (`response["message"]["content"]`) and
-    attribute-style (`response.message.content`) shapes, across ollama-py
-    versions.
-    """
-    # Mapping form (typical for `ollama.chat`).
-    if isinstance(response, Mapping):
-        message = response.get("message")
-        if isinstance(message, Mapping):
-            content = message.get("content")
-            if isinstance(content, str):
-                return content
-        content = response.get("content")
-        if isinstance(content, str):
-            return content
-    # Attribute form (pydantic-style objects in some versions).
-    message = getattr(response, "message", None)
-    if message is not None:
-        content = getattr(message, "content", None)
-        if isinstance(content, str):
-            return content
-    content = getattr(response, "content", None)
-    if isinstance(content, str):
-        return content
-
-    msg = f"Unrecognized Ollama response shape: {type(response).__name__}"
-    logger.error(msg)
-    raise OllamaChatError(msg)
-
-
-# ---------------------------------------------------------------------------
-# Convenience helpers
+# Streaming chat
 # ---------------------------------------------------------------------------
 def chat_stream(
     messages: Sequence[Mapping[str, Any]] | str,
@@ -358,6 +466,7 @@ def chat_stream(
     model: str = DEFAULT_MODEL,
     auto_pull: bool = True,
     options: Mapping[str, Any] | None = None,
+    host: str | None = None,
     **kwargs: Any,
 ) -> Iterable[str]:
     """
@@ -377,12 +486,12 @@ def chat_stream(
         raise ValueError("`messages` must contain at least one message.")
 
     try:
-        resolved_model = ensure_model(model, auto_pull=auto_pull)
+        resolved_model = ensure_model(model, auto_pull=auto_pull, host=host)
     except OllamaClientError as exc:
         raise OllamaChatError(str(exc)) from exc
 
     try:
-        stream = ollama.chat(
+        stream = _get_client(host).chat(
             model=resolved_model,
             messages=normalized,
             stream=True,
@@ -395,7 +504,7 @@ def chat_stream(
             except OllamaChatError:
                 logger.warning("Skipping malformed stream chunk.")
                 continue
-    except (ollama.ResponseError, ollama.RequestError) as exc:
+    except (ResponseError, ConnectionError) as exc:
         logger.error("Streaming chat failed: %s", exc)
         raise OllamaChatError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -403,8 +512,56 @@ def chat_stream(
         raise OllamaChatError(str(exc)) from exc
 
 
+# ---------------------------------------------------------------------------
+# Internal utilities
+# ---------------------------------------------------------------------------
+def _as_mapping(response: Any) -> Mapping[str, Any]:
+    """Normalize a chat response into a plain mapping (best effort)."""
+    if isinstance(response, Mapping):
+        return response
+    try:
+        return response.model_dump()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _extract_content(response: Any) -> str:
+    """
+    Pull the assistant's textual content out of an Ollama chat response.
+
+    Supports both mapping-style (`response["message"]["content"]`) and
+    attribute-style (`response.message.content`) shapes, across ollama-py
+    versions.
+    """
+    # Mapping form (typical for `ollama.chat` / older clients).
+    if isinstance(response, Mapping):
+        message = response.get("message")
+        if isinstance(message, Mapping):
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+        content = response.get("content")
+        if isinstance(content, str):
+            return content
+    # Attribute form (pydantic-style objects in modern versions);
+    # ChatResponse.message is a pydantic Message, so .content works.
+    message = getattr(response, "message", None)
+    if message is not None:
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content
+    content = getattr(response, "content", None)
+    if isinstance(content, str):
+        return content
+
+    msg = f"Unrecognized Ollama response shape: {type(response).__name__}"
+    logger.error(msg)
+    raise OllamaChatError(msg)
+
+
 __all__ = [
     "ChatResult",
+    "DEFAULT_HOST",
     "DEFAULT_MODEL",
     "OllamaChatError",
     "OllamaClientError",
@@ -413,4 +570,5 @@ __all__ = [
     "chat",
     "chat_stream",
     "ensure_model",
+    "runtime_available",
 ]

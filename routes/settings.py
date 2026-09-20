@@ -50,6 +50,24 @@ async def save_initial_settings(settings: InitialSettings):
     with open(CONFIG_PATH, "w") as f:
         json.dump(config_data, f, indent=4)
 
+    # Apply the new settings to the running process immediately so the
+    # worker picks them up without a restart.
+    if "annotator_id" in updates or "annotator_password" in updates:
+        from routes.login import configure as configure_login
+
+        configure_login(
+            annotator_id=config_data.get("annotator_id"),
+            annotator_password=config_data.get("annotator_password"),
+        )
+    if "base_url" in updates:
+        from routes import call_server
+
+        call_server.set_base_url(config_data["base_url"])
+    if "model_name" in updates:
+        from routes.model import set_active_model
+
+        set_active_model(config_data["model_name"])
+
     return {
         "status": "success",
         "message": "Initial settings saved successfully.",

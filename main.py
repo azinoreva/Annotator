@@ -9,13 +9,13 @@ import shutil
 import subprocess
 from contextlib import asynccontextmanager
 
-import ollama
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 import uvicorn
 
 import worker
 from db import init_db, close_db
+from routes import ai_access
 from routes import call_server
 from routes import settings as settings_routes
 from routes.login import configure as configure_login, ensure_token
@@ -96,11 +96,8 @@ def install_ollama() -> None:
 
 
 def is_ollama_running() -> bool:
-    try:
-        ollama.Client(host=OLLAMA_BASE_URL).list()
-        return True
-    except Exception:
-        return False
+    """Bounded, non-raising probe — never blocks longer than the probe timeout."""
+    return ai_access.runtime_available(OLLAMA_BASE_URL)
 
 
 def start_ollama_server() -> subprocess.Popen:
@@ -110,46 +107,21 @@ def start_ollama_server() -> subprocess.Popen:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    for _ in range(30):
+    # Poll with the bounded probe; the loop cannot hang because each probe
+    # is capped by ai_access.PROBE_TIMEOUT.
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
         if is_ollama_running():
             log.info("Ollama server is up.")
             return proc
         time.sleep(1)
+    proc.terminate()
     raise RuntimeError("Ollama server did not become ready within 30 s")
-
-
-def _model_present(model_name: str) -> bool:
-    try:
-        listing = ollama.Client(host=OLLAMA_BASE_URL).list()
-    except Exception:
-        return False
-
-    # ollama-python >=0.3 returns an object with .models; older returns a dict.
-    models = getattr(listing, "models", None)
-    if models is None and isinstance(listing, dict):
-        models = listing.get("models", [])
-
-    for m in models or []:
-        name = getattr(m, "model", None) or (m.get("name") if isinstance(m, dict) else None)
-        if name == model_name:
-            return True
-    return False
 
 
 def ensure_model(model_name: str) -> None:
     """Pull the requested model if it isn't already present locally."""
-    if _model_present(model_name):
-        log.info("Model '%s' is already installed.", model_name)
-        return
-
-    log.info("Pulling model '%s' (this may take a while)...", model_name)
-    client = ollama.Client(host=OLLAMA_BASE_URL)
-    for chunk in client.pull(model_name, stream=True):
-        status = getattr(chunk, "status", None) or (
-            chunk.get("status") if isinstance(chunk, dict) else None
-        )
-        if status:
-            log.info("  pull: %s", status)
+    ai_access.ensure_model(model_name, host=OLLAMA_BASE_URL)
     log.info("Model '%s' ready.", model_name)
 
 

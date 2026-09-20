@@ -59,6 +59,11 @@ def configure(
     _acquired_at = 0.0
 
 
+def is_configured() -> bool:
+    """Whether login credentials have been provided (not whether login works)."""
+    return bool(_annotator_id and _annotator_password)
+
+
 async def login() -> dict:
     """Log in and cache the returned tokens. Raises on non-2xx."""
     if not _annotator_id or not _annotator_password:

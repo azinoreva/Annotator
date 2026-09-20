@@ -1,0 +1,6 @@
+{
+    "model_name": "qwen2.5-coder:7b",
+    "annotator_id": "annotator_1",
+    "annotator_password": "annotator_1_secure",
+    "base_url": "http://127.0.0.1:8000"
+}
