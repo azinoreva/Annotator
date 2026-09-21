@@ -334,6 +334,40 @@ def _raise_chat_error(model: str, attempts: int, last_error: Exception) -> None:
 # ---------------------------------------------------------------------------
 # Chat entry point
 # ---------------------------------------------------------------------------
+def _iter_chat(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    model: str,
+    options: Mapping[str, Any] | None,
+    host: str | None,
+    **kwargs: Any,
+) -> Iterable[str]:
+    """
+    Yield content chunks from a *streaming* chat completion.
+
+    Streaming means the httpx read timeout is enforced *between tokens*,
+    not across the whole response, so a slow-but-progressing generation
+    (common for small local models) is no longer killed by a fixed wall
+    clock. Underlying errors (httpx timeouts, ResponseError, ...) propagate
+    unchanged so callers can classify them for retries.
+    """
+    stream = _get_client(host).chat(
+        model=model,
+        messages=messages,
+        stream=True,
+        options=dict(options) if options else None,
+        **kwargs,
+    )
+    for chunk in stream:
+        try:
+            content = _extract_content(chunk)
+        except OllamaChatError:
+            # Ollama emits a trailing "done" chunk that carries no content.
+            continue
+        if content:
+            yield content
+
+
 def chat(
     messages: Sequence[Mapping[str, Any]] | str,
     *,
@@ -368,6 +402,10 @@ def chat(
     **kwargs
         Forwarded verbatim to :func:`ollama.chat`.
 
+    Internally the completion is requested as a *stream* and accumulated, so
+    the httpx read timeout applies between tokens rather than to the whole
+    generation.
+
     Returns
     -------
     ChatResult
@@ -396,7 +434,6 @@ def chat(
     except OllamaClientError as exc:
         raise OllamaChatError(str(exc)) from exc
 
-    client = _get_client(host)
     attempts = retries + 1
     last_error: Exception | None = None
 
@@ -408,13 +445,18 @@ def chat(
                 attempts,
                 resolved_model,
             )
-            response = client.chat(
+            parts: list[str] = []
+            for chunk in _iter_chat(
+                normalized,
                 model=resolved_model,
-                messages=normalized,
-                options=dict(options) if options else None,
+                options=options,
+                host=host,
                 **kwargs,
-            )
-            content = _extract_content(response)
+            ):
+                parts.append(chunk)
+            content = "".join(parts)
+            if not content:
+                raise RuntimeError("Model returned an empty response.")
             logger.info(
                 "Chat succeeded with model '%s' (%d chars).",
                 resolved_model,
@@ -423,7 +465,7 @@ def chat(
             return ChatResult(
                 content=content,
                 model=resolved_model,
-                raw=_as_mapping(response),
+                raw={"content": content},
             )
         except Exception as exc:  # noqa: BLE001 — normalize & classify
             last_error = exc
@@ -491,19 +533,14 @@ def chat_stream(
         raise OllamaChatError(str(exc)) from exc
 
     try:
-        stream = _get_client(host).chat(
+        for chunk in _iter_chat(
+            normalized,
             model=resolved_model,
-            messages=normalized,
-            stream=True,
-            options=dict(options) if options else None,
+            options=options,
+            host=host,
             **kwargs,
-        )
-        for chunk in stream:
-            try:
-                yield _extract_content(chunk)
-            except OllamaChatError:
-                logger.warning("Skipping malformed stream chunk.")
-                continue
+        ):
+            yield chunk
     except (ResponseError, ConnectionError) as exc:
         logger.error("Streaming chat failed: %s", exc)
         raise OllamaChatError(str(exc)) from exc
@@ -515,16 +552,6 @@ def chat_stream(
 # ---------------------------------------------------------------------------
 # Internal utilities
 # ---------------------------------------------------------------------------
-def _as_mapping(response: Any) -> Mapping[str, Any]:
-    """Normalize a chat response into a plain mapping (best effort)."""
-    if isinstance(response, Mapping):
-        return response
-    try:
-        return response.model_dump()
-    except Exception:  # noqa: BLE001
-        return {}
-
-
 def _extract_content(response: Any) -> str:
     """
     Pull the assistant's textual content out of an Ollama chat response.

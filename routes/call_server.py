@@ -9,9 +9,29 @@ from typing import Annotated, AsyncIterator, Optional
 from pydantic import BaseModel, Field
 
 import crud
+from models.aggregates import Categories as ServerCategories, MAIN_CLASSIFICATIONS
 
 
 log = logging.getLogger("annotator.call_server")
+
+
+# The server's SentAnnotations.safety is a *required* field. Send a
+# schema-valid empty annotation when the morality pass was skipped.
+EMPTY_SAFETY = {
+    "schema_version": "1.0",
+    "flags": [],
+    "context": {"stance": "unclear"},
+}
+
+# The server only accepts leaf Categories enum values for `category`.
+# Main-classification group names like "sci-tech" / "society" / "interests"
+# are not enum members, so each group gets a canonical leaf fallback when no
+# usable subcategory score exists.
+_MAIN_TO_LEAF = {
+    "sci-tech": "science",
+    "society": "social",
+    "interests": "hobbies",
+}
 
 
 class Categories(str, Enum):
@@ -136,17 +156,39 @@ async def send_annotations(
     }
 
     correlations = (annotations or {}).get("correlations") or {}
+    valid = {c.value for c in ServerCategories}
+    valid_correlations = {
+        key: value for key, value in correlations.items() if key in valid
+    }
+
+    # `category` must be a single leaf Categories value (the chosen category
+    # the server swaps the update into), not a main-group name. Use the
+    # strongest valid subcategory, then a canonical leaf for the group, then
+    # any valid subcategory belonging to the group.
+    leaf = max(valid_correlations, key=valid_correlations.get, default=None)
+    if leaf is None:
+        for subcategory in MAIN_CLASSIFICATIONS.get(category, []):
+            if subcategory in valid:
+                leaf = subcategory
+                break
+    if leaf is None:
+        leaf = _MAIN_TO_LEAF.get(category)
+    if leaf is None:
+        raise ValueError(
+            f"Category '{category}' cannot be mapped to a server "
+            f"Categories enum value."
+        )
+
     payload = {
         "update_id": update_id,
         "user_id": user_id,
-        "category": category,
+        "category": leaf,
         "annotations": [
             {"category": key, "score": value}
-            for key, value in correlations.items()
+            for key, value in valid_correlations.items()
         ],
+        "safety": morality if morality is not None else EMPTY_SAFETY,
     }
-    if morality is not None:
-        payload["safety"] = morality
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(url, headers=headers, json=payload)

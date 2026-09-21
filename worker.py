@@ -281,18 +281,36 @@ def _morality_check(text: str) -> Optional[dict]:
         {"role": "system", "content": _SAFETY.system_message()},
         {"role": "user", "content": _SAFETY.user_message(text)},
     ]
-    response = chat(messages, model=get_active_model()).content
+    last_error: Optional[Exception] = None
 
-    try:
-        annotation = _SAFETY.parse(response)
-    except ValueError as exc:
-        # The model sometimes invents flags outside the taxonomy (e.g. an
-        # unknown content flag). That is a malformed model answer, not an
-        # infrastructure failure — degrade gracefully by leaving the
-        # morality pass unverified instead of failing the whole item.
-        log.warning(
-            "Morality check skipped (malformed model response): %s", exc
-        )
-        return None
+    for attempt in range(2):
+        response = chat(messages, model=get_active_model()).content
 
-    return annotation.model_dump()
+        try:
+            annotation = _SAFETY.parse(response)
+            return annotation.model_dump()
+        except ValueError as exc:
+            last_error = exc
+            if attempt == 0:
+                # The model often invents flags outside the taxonomy (e.g. an
+                # unknown content flag). One corrective pass usually fixes it;
+                # after that, degrade gracefully instead of failing the item.
+                messages = [
+                    {"role": "system", "content": _SAFETY.system_message()},
+                    {"role": "user", "content": _SAFETY.user_message(text)},
+                    {"role": "assistant", "content": response},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your response was rejected for this reason: "
+                            f"{exc}. Re-read the allowed taxonomy carefully "
+                            "and return valid JSON using ONLY the allowed "
+                            "flags and subcategories."
+                        ),
+                    },
+                ]
+
+    log.warning(
+        "Morality check skipped (malformed model response): %s", last_error
+    )
+    return None
