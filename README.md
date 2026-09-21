@@ -87,7 +87,7 @@ is managed through the settings endpoint:
 
 | Field                 | Description                                      |
 | --------------------- | ------------------------------------------------ |
-| `model_name`          | Ollama model to use for annotation (default `llama3.2:3b`) |
+| `model_name`          | Ollama model to use for annotation (default `llama3.2:1b`) |
 | `annotator_id`        | Annotator identity registered with the server    |
 | `annotator_password`  | Annotator password                               |
 | `base_url`            | Aggregator server base URL (default `http://127.0.0.1:8000`) |
